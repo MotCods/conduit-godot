@@ -9,6 +9,10 @@ void main() {
     test('exposes backend-neutral picker and filename helpers', () {
       check(kLocalDocumentPickerExtensions).contains('txt');
       check(kLocalDocumentPickerExtensions).contains('docx');
+      check(kLocalDocumentPickerExtensions).contains('gd');
+      check(kLocalDocumentPickerExtensions).contains('zip');
+      check(isLocalDocumentFileNameSupported('project.godot')).isTrue();
+      check(isLocalDocumentFileNameSupported('main.tscn')).isTrue();
       check(isLocalDocumentFileNameSupported('README')).isTrue();
       check(isLocalDocumentFileNameSupported('archive.pdf')).isFalse();
       check(
