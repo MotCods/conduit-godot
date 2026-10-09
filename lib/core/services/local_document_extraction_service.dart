@@ -34,13 +34,17 @@ const List<String> kLocalDocumentPickerExtensions = <String>[
   'dockerignore',
   'docx',
   'editorconfig',
+  'gd',
+  'gdshader',
   'env',
   'gitignore',
   'go',
+  'godot',
   'h',
   'hpp',
   'htm',
   'html',
+  'import',
   'ini',
   'java',
   'js',
@@ -60,12 +64,16 @@ const List<String> kLocalDocumentPickerExtensions = <String>[
   'sql',
   'swift',
   'toml',
+  'tres',
   'ts',
+  'tscn',
   'tsv',
   'txt',
+  'uid',
   'xml',
   'yaml',
   'yml',
+  'zip',
 ];
 
 bool isLocalDocumentFileNameSupported(String name) {
@@ -497,14 +505,17 @@ final class LocalDocumentExtractionService {
       );
     }
     if (hasZipSignature) {
-      if (!expectsDocx) {
-        throw _documentFailure(
-          LocalDocumentExtractionError.unsupportedType,
-          name,
-          '$name is an unsupported archive.',
-        );
+      if (expectsDocx) {
+        return _extractDocx(bytes, name);
       }
-      return _extractDocx(bytes, name);
+      if (extension == '.zip') {
+        return _extractZipBundle(bytes, name);
+      }
+      throw _documentFailure(
+        LocalDocumentExtractionError.unsupportedType,
+        name,
+        '$name is an unsupported archive.',
+      );
     }
 
     if (!_isSupportedTextSource(extension, name, mimeType)) {
@@ -578,6 +589,127 @@ final class LocalDocumentExtractionService {
       text: extraction.text,
       mimeType: 'application/pdf',
     );
+  }
+
+  _ExtractedDocument _extractZipBundle(Uint8List bytes, String name) {
+    ZipDirectory? directory;
+    try {
+      // Same central-directory preflight as DOCX, so a hostile archive is
+      // rejected before any entry is expanded.
+      final zipPreflight = _validateDocxZipCentralDirectory(
+        bytes,
+        maxEntries: limits.maxDocxZipEntries,
+        maxCentralDirectoryBytes: limits.maxDocxCentralDirectoryBytes,
+      );
+      directory = ZipDirectory()..read(InputMemoryStream(bytes));
+      final headers = directory.fileHeaders;
+      if (headers.length != zipPreflight.entryCount) {
+        throw const FormatException('Mismatched ZIP entry count');
+      }
+      if (headers.any(_zipEntryIsEncrypted)) {
+        throw _documentFailure(
+          LocalDocumentExtractionError.encryptedDocument,
+          name,
+          '$name is encrypted or password protected.',
+        );
+      }
+
+      // Reserve room for the closing note so the bundle stays under the
+      // aggregate character limit enforced by the caller.
+      const noteReserve = 400;
+      final characterBudget = limits.maxAggregateCharacters - noteReserve;
+      final buffer = StringBuffer();
+      var includedCount = 0;
+      var omittedCount = 0;
+      var truncated = false;
+      var expandedTotal = 0;
+
+      for (final header in headers) {
+        final entryName = header.filename;
+        // Directories and links are never expanded.
+        if (entryName.endsWith('/') || _zipEntryIsUnixSymlink(header)) {
+          continue;
+        }
+        if (!_isZipBundleTextEntry(entryName)) {
+          omittedCount++;
+          continue;
+        }
+        final file = header.file;
+        if (file == null || file.filename != entryName) {
+          throw const FormatException('Mismatched ZIP entry names');
+        }
+        final remainingCharacters = characterBudget - buffer.length;
+        if (remainingCharacters <= 0) {
+          omittedCount++;
+          continue;
+        }
+        if (header.uncompressedSize > limits.maxSourceBytes ||
+            expandedTotal + header.uncompressedSize >
+                limits.maxExpandedDocumentBytes) {
+          omittedCount++;
+          continue;
+        }
+
+        final entryOutput = _BoundedOutputMemoryStream(limits.maxSourceBytes);
+        try {
+          file.decompress(entryOutput);
+        } on _ExpandedDocumentLimitException {
+          omittedCount++;
+          continue;
+        }
+        final entryBytes = entryOutput.getBytes();
+        expandedTotal += entryBytes.length;
+
+        final decoded = _tryDecodeZipEntryUtf8(entryBytes);
+        if (decoded == null) {
+          // Binary or non-UTF-8 content: skip rather than fail the archive.
+          omittedCount++;
+          continue;
+        }
+        var content = decoded;
+        if (content.length > remainingCharacters) {
+          content = content.substring(0, remainingCharacters);
+          truncated = true;
+        }
+        buffer
+          ..write('\n=== FILE: $entryName ===\n')
+          ..write(content);
+        includedCount++;
+        if (truncated) break;
+      }
+
+      if (includedCount == 0) {
+        throw _documentFailure(
+          LocalDocumentExtractionError.emptyDocument,
+          name,
+          '$name contains no readable text files.',
+        );
+      }
+      if (omittedCount > 0 || truncated) {
+        buffer.write(
+          '\n\n=== Note: $omittedCount file(s) omitted (binary, too large, '
+          'or outside the archive limits)'
+          '${truncated ? '; the last file was cut short at the character limit' : ''}'
+          ' ===\n',
+        );
+      }
+      return _ExtractedDocument(
+        text: buffer.toString(),
+        mimeType: 'text/plain',
+      );
+    } on LocalDocumentExtractionException {
+      rethrow;
+    } catch (_) {
+      throw _documentFailure(
+        LocalDocumentExtractionError.malformedDocument,
+        name,
+        '$name could not be decoded as a ZIP archive.',
+      );
+    } finally {
+      for (final header in directory?.fileHeaders ?? const <ZipFileHeader>[]) {
+        header.file?.closeSync();
+      }
+    }
   }
 
   _ExtractedDocument _extractDocx(Uint8List bytes, String name) {
@@ -741,12 +873,43 @@ final class _BoundedOutputMemoryStream extends OutputMemoryStream {
   }
 }
 
+const _zipBundleExcludedExtensions = <String>{'docx', 'zip'};
+
+/// Decides whether a zip entry should be read into a project bundle.
+///
+/// Uses the same allow-list as the picker, plus Godot project files, and skips
+/// version-control and Godot cache folders.
+bool _isZipBundleTextEntry(String entryName) {
+  final lower = entryName.toLowerCase();
+  if (lower.startsWith('.git/') ||
+      lower.contains('/.git/') ||
+      lower.startsWith('.godot/') ||
+      lower.contains('/.godot/')) {
+    return false;
+  }
+  if (!isLocalDocumentFileNameSupported(entryName)) return false;
+  final dot = lower.lastIndexOf('.');
+  if (dot >= 0 &&
+      _zipBundleExcludedExtensions.contains(lower.substring(dot + 1))) {
+    return false;
+  }
+  return true;
+}
+
+String? _tryDecodeZipEntryUtf8(List<int> bytes) {
+  try {
+    return utf8.decode(bytes, allowMalformed: false);
+  } on FormatException {
+    return null;
+  }
+}
+
 const _docxMimeType =
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
 final _textExtensions = <String>{
   for (final extension in kLocalDocumentPickerExtensions)
-    if (extension != 'docx') '.$extension',
+    if (extension != 'docx' && extension != 'zip') '.$extension',
 };
 
 const _textMimeTypes = <String>{
